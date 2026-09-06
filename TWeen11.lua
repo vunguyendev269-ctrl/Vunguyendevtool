@@ -184,10 +184,12 @@ local movementId = 0
 local currentMovement = nil
 local fpsEma = nil
 local lastFrameTime = os.clock()
-local status  -- forward declare, GUI gan sau
+local status      -- forward declare: GUI gan sau, core doc truoc
+local screen, hudConn, toggleConn  -- GUI globals de cleanup thay duoc
 
 -- do FPS (EMA) de biet may yeu hay lag server
-RunService.RenderStepped:Connect(function()
+local fpsConn
+fpsConn = RunService.RenderStepped:Connect(function()
     local now = os.clock()
     local dt = now - lastFrameTime
     lastFrameTime = now
@@ -422,8 +424,8 @@ local function moveTo(name, rawTarget)
 
     movementId += 1
     local id = movementId
-    local speed = math.clamp(tonumber(env.TLSpeed) or 325, 100, 500)
     local t0 = os.clock()
+    local speed = math.clamp(tonumber(env.TLSpeed) or 325, 100, 500) -- chi dung cho log/status luc khoi dong
 
     -- resolve target + ground snap (BF49 resolveTarget)
     local target = resolveTarget(character, root, humanoid, rawTarget)
@@ -502,14 +504,37 @@ local function moveTo(name, rawTarget)
             return
         end
 
-        -- noclip raycast theo huong di (BF49: 5 offset, 3 bounce, tra ve sau 0.28s)
-        applyNoclip(data, root.Position, data.proxy.Position)
+        dt = math.clamp(dt or 0.016, 0.001, 0.1)
+        local now = os.clock()
+        local speed = env.TLSpeed  -- doc moi: applySpeed giua chung co hieu luc ngay
 
+        local serverPos = root.Position           -- vi tri server dang giu (truoc khi ep)
         local proxyPos = data.proxy.Position
-        local appliedPos = data.lastApplied
+
+        -- push = do lech giua noi ta dat xong frame truoc va noi server tra ve
+        -- (day la tin hieu bi day/bjtp - phai do TRUOC khi ep, khong phai sau)
+        local push = (serverPos - data.lastApplied).Magnitude
+        data.maxDev = math.max(data.maxDev, push)
+        if push >= CFG.JumpSnap then
+            data.jumpSnaps += 1
+            dbgLog(string.format("WARN jump-snap %.0f studs (lan %d) - resync proxy tu day",
+                push, data.jumpSnaps))
+            if data.phase == "travel" then
+                data.proxy.CFrame = CFrame.new(serverPos) * data.rotation
+                launchProxyTween(data, speed)
+            else
+                data.proxy.CFrame = data.target   -- dang o dich -> keo thang ve dich
+            end
+            proxyPos = data.proxy.Position
+        end
+
+        -- noclip raycast theo huong di (BF49: 5 offset, 3 bounce, tra ve sau 0.28s)
+        applyNoclip(data, serverPos, proxyPos)
+
+        -- toc do proxy = xich ke / dt, cap speed*1.03 (BF49 stabilizer)
         local velocity = Vector3.zero
         if dt > 0 then
-            velocity = (proxyPos - appliedPos) / dt
+            velocity = (proxyPos - data.lastApplied) / dt
             local maxVel = speed * 1.03
             if velocity.Magnitude > maxVel then velocity = velocity.Unit * maxVel end
         end
@@ -518,32 +543,21 @@ local function moveTo(name, rawTarget)
         end
 
         -- ep nhan vat theo proxy (cot loi cua phuong phap proxy)
-        root.CFrame = data.proxy.CFrame
+        root.CFrame = CFrame.new(proxyPos) * data.rotation
         setVelocity(root, velocity)
         data.lastApplied = proxyPos
 
-        -- phat hien bi day/teleport (delta 1 frame bat thuong = bjtp, tween.txt)
-        local delta = (proxyPos - data.lastProxyPosition).Magnitude
-        data.lastProxyPosition = proxyPos
-        if delta >= CFG.JumpSnap then
-            data.jumpSnaps += 1
-            dbgLog(string.format("WARN jump-snap %.0f studs (lan %d) - resync proxy", delta, data.jumpSnaps))
-            data.proxy.CFrame = data.target  -- tween tu cho hien tai ve dich
-            launchProxyTween(data, speed)
-        end
-
-        local remaining = (root.Position - data.target.Position).Magnitude
+        local remaining = (proxyPos - data.target.Position).Magnitude       -- proxy con bao xa
+        local srvOff = (serverPos - data.target.Position).Magnitude         -- server giu minh cach dich bao xa
         data.lastRemaining = remaining
-        data.maxDev = math.max(data.maxDev, (root.Position - proxyPos).Magnitude)
 
-        local now = os.clock()
         local quietFor = now - data.lastCorrectionAt
-        local settleNeed = data.stopRequested and CFG.SettleStopMin or CFG.SettleMin
-        local quietNeed = math.min((data.stopRequested and CFG.SettleStopMin or CFG.SettleMin)
-            + data.releaseRetries * 1.1, 6)
+        -- BF49: settle dai ra theo so lan that bai
+        local settleNeed = math.min(
+            (data.stopRequested and CFG.SettleStopMin or CFG.SettleMin) + data.releaseRetries * 1.25, 7)
+        local quietNeed = math.min(CFG.QuietNeed + data.releaseRetries * 1.1, 6)
 
         if data.phase == "travel" then
-            -- proxy toi noi (<=1.5 studs) -> vao settle
             if remaining <= 1.5 then
                 data.phase = "settle"
                 data.pTravel = now - data.t0
@@ -552,34 +566,31 @@ local function moveTo(name, rawTarget)
                 if data.tween then pcall(function() data.tween:Cancel() end) end
                 data.proxy.CFrame = data.target
                 setVelocity(root, Vector3.zero)
-            else
-                -- bi server day xa -> correction (tran so lan)
-                local dev = (root.Position - proxyPos).Magnitude
-                if dev > 12 and now - data.lastCorrectionAt > 0.6 then
-                    data.corrections += 1
-                    data.lastCorrectionAt = now
-                    if data.corrections > CFG.MaxCorrections then
-                        data.outcome = "push-out"
-                        dbgLog(string.format("WARN bi day %d lan - bo cuoc sau %.1fs",
-                            data.corrections, now - data.t0))
-                        finishMovement(id, data, name, speed)
-                        return
-                    end
-                    launchProxyTween(data, speed)
+            elseif push > CFG.PushHoriz and now - data.lastCorrectionAt > 0.6 then
+                -- server keo di >45 studs khi dang bay -> tinh 1 correction (tran cap)
+                data.corrections += 1
+                data.lastCorrectionAt = now
+                if data.corrections > CFG.MaxCorrections then
+                    data.outcome = "push-out"
+                    dbgLog(string.format("WARN bi day %d lan - bo cuoc sau %.1fs",
+                        data.corrections, now - data.t0))
+                    finishMovement(id, data, name, speed)
+                    return
                 end
+                launchProxyTween(data, speed)
             end
 
         elseif data.phase == "settle" then
             -- giu chat tai dich cho den khi "yen" du lau
             root.CFrame = data.target
             setVelocity(root, Vector3.zero)
-            if remaining > 4 then
-                -- bi day ra khoi vi tri settle -> reset dong ho
+            if srvOff > 4 then
+                -- bi day ra khoi dich trong luc settle -> chay lai dong ho
                 data.lastCorrectionAt = now
                 data.releaseRetries += 1
-                if data.releaseRetries > CFG.MaxReleaseRetry then
+                if data.releaseRetries > CFG.MaxReleaseRetry + 2 then
                     data.outcome = "release-fail"
-                    dbgLog(string.format("WARN settle that bai %d lan - release cuoi", data.releaseRetries))
+                    dbgLog(string.format("WARN settle that bai %d lan - buoc release", data.releaseRetries))
                 end
             end
             if quietFor >= quietNeed and now - data.phaseStartedAt >= settleNeed then
@@ -587,24 +598,25 @@ local function moveTo(name, rawTarget)
                 data.pSettle = now - data.phaseStartedAt
                 data.phaseStartedAt = now
                 data.releaseEnteredAt = now
+                dbgLog(string.format("settle %.2fs (quiet %.2fs) -> release", data.pSettle, quietFor))
             end
 
         elseif data.phase == "release" then
-            -- xac nhan on dinh sau khi tha (BF49: 2.5s)
-            if remaining > 6 then
-                -- tha xong bi keo di -> quay lai settle
+            -- khong con ep nua (velocity=0, stabilizer zero) - xem server co giu minh
+            if srvOff > 6 then
                 data.phase = "settle"
                 data.phaseStartedAt = now
                 data.lastCorrectionAt = now
                 data.proxy.CFrame = data.target
-                data.root.CFrame = data.target
+                root.CFrame = data.target
+                dbgLog(string.format("WARN release bi keo %.1f studs -> settle lai", srvOff))
             elseif now - data.phaseStartedAt >= CFG.ReleaseConfirm then
                 finishMovement(id, data, name, speed)
                 return
             end
         end
 
-        -- cap nhat status label + HUD (throttle)
+        -- cap nhat status label (throttle)
         if now - data.lastStatusAt >= CFG.HudRefresh then
             data.lastStatusAt = now
             if status and id == movementId then
@@ -868,10 +880,11 @@ env.TweenLab = {
         end
     end,
     Cleanup = cleanupScript,
-    set Speed(v) applySpeed(v) end,
-    get Speed() return env.TLSpeed end,
+    GetSpeed = function() return env.TLSpeed end,
+    SetSpeed = function(v) applySpeed(v) end,
+    Destinations = destinations,
 }
 
 applySpeed(env.TLSpeed)  -- highlight nut dung speed hien tai
-dbgLog("API: TweenLab.Go(\"Hydra Island\") / .Stop() / .Speed=340 / .Cleanup()")
+dbgLog("API: TweenLab.Go(\"Hydra Island\") / .Stop() / .SetSpeed(340) / .Cleanup()")
 dbgLog("An nut dao de bay | STOP de dung an toan | RightControl an/hien GUI")
