@@ -636,7 +636,7 @@ local function applySpeed(v)
         dbgLog(string.format("speed doi -> %d giua chung (con %.0f studs)", v, data.lastRemaining))
     end
     for _, btn in ipairs(speedButtons) do
-        if btn.value == v then
+        if btn:GetAttribute("SpeedValue") == v then
             btn.BackgroundColor3 = Color3.fromRGB(75, 110, 220)
         else
             btn.BackgroundColor3 = Color3.fromRGB(35, 40, 55)
@@ -753,7 +753,7 @@ local function makeSpeedBtn(v, x)
     btn.TextSize = 15
     btn.TextColor3 = Color3.fromRGB(220, 225, 235)
     btn.Text = tostring(v)
-    btn.value = v
+    btn:SetAttribute("SpeedValue", v)
     btn.Parent = speedRow
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
     btn.MouseButton1Click:Connect(function() applySpeed(v) end)
