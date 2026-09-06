@@ -107,7 +107,6 @@ local function makePage(name, idx)
 
     local gui = Instance.new("SurfaceGui")
     gui.Face = Enum.NormalId.Front
-    gui.Padding = 8
     gui.Parent = part
 
     local label = Instance.new("TextLabel")
@@ -160,7 +159,6 @@ local function buildHud()
 
     local gui = Instance.new("SurfaceGui")
     gui.Face = Enum.NormalId.Front
-    gui.Padding = 8
     gui.Parent = part
 
     hudLabel = Instance.new("TextLabel")
